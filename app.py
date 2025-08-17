@@ -1,7 +1,5 @@
-import math
 from dataclasses import dataclass
-from typing import Optional, List
-import pandas as pd
+from typing import Optional
 import streamlit as st
 
 st.set_page_config(page_title="Rent vs Buy (UK & Hong Kong)", page_icon="🏠", layout="wide")
@@ -175,6 +173,17 @@ class Results:
     net_cost_owning_opp: Optional[float] = None
     net_cost_renting_opp: Optional[float] = None
     breakeven_growth_simple: Optional[float] = None
+    
+    @property
+    def net_sale_price(self) -> float:
+        """Sale price minus sale costs"""
+        return self.final_sale_price - self.sale_costs
+    
+    def net_gain_after_sale(self, initial_price: float, ltv: float) -> float:
+        """Net gain = net sale price - outstanding mortgage - total cash invested"""
+        deposit = initial_price * (1 - ltv)
+        total_cash_invested = deposit + self.buy_one_offs + self.owner_running + self.interest_paid
+        return self.net_sale_price - self.outstanding_balance - total_cash_invested
 
 
 def _compute_core(inputs: Inputs) -> Results:
@@ -293,6 +302,75 @@ def _compute_core(inputs: Inputs) -> Results:
         breakeven_growth_simple=None,
     )
 
+def build_owner_cashflows_for_irr(inputs: Inputs, res: Results):
+    """Return monthly equity cash flows for IRR:
+    t=0: -(deposit + buy_one_offs)
+    months 1..T-1: -(interest + principal + owner_running_monthly)
+    month T: same as above but PLUS terminal equity (net sale price - outstanding balance)
+    """
+    months = inputs.hold_years * 12
+    # Recompute pieces exactly as in _compute_core to ensure consistency
+    deposit = inputs.price * (1 - inputs.ltv)
+    loan = inputs.price - deposit
+    A = monthly_payment(loan, inputs.rate, inputs.term_years)
+
+    # Owner running monthly (mirror _compute_core)
+    if inputs.jurisdiction.upper() == "UK":
+        owner_extra_monthly = inputs.service_charge
+        rv_annual = 0.0
+        rates_like_annual = 0.0
+        govrent_annual = 0.0
+    else:
+        owner_extra_monthly = inputs.mgmt_fee_psf * inputs.net_area_sqft + inputs.service_charge
+        rv_annual = inputs.rent * 12
+        rates_like_annual = inputs.hk_rates_override_annual if inputs.hk_rates_override_annual is not None else hk_rates_annual_from_rent(rv_annual)
+        govrent_annual = inputs.hk_govrent_override_annual if inputs.hk_govrent_override_annual is not None else hk_government_rent_annual(rv_annual)
+
+    maintenance_monthly = (inputs.maintenance_rate * inputs.price) / 12.0
+    owner_running_monthly = maintenance_monthly + owner_extra_monthly + (rates_like_annual / 12.0) + (govrent_annual / 12.0)
+
+    # Buy one-offs
+    if inputs.jurisdiction.upper() == "UK":
+        buy_one_offs = (sdlt_england_main_residence(inputs.price, surcharge=inputs.sdlt_surcharge)
+                        if inputs.sdlt_override is None else inputs.sdlt_override) + inputs.buy_legal
+    else:
+        buy_one_offs = (hk_avd_scale2(inputs.price)
+                        if inputs.sdlt_override is None else inputs.sdlt_override) + inputs.buy_legal + (inputs.agent_buy_rate * inputs.price)
+
+    # Monthly split of payment into interest/principal
+    r_m = inputs.rate / 12.0
+    bal = loan
+    cashflows = []
+    # t=0 outflow
+    cashflows.append(-(deposit + buy_one_offs))
+
+    for m in range(1, months + 1):
+        interest = bal * r_m
+        principal = A - interest
+        bal = max(0.0, bal - principal)
+        outflow = -(interest + principal + owner_running_monthly)
+        cashflows.append(outflow)
+
+    # Add terminal equity in final month
+    ending_equity = res.net_sale_price - res.outstanding_balance
+    cashflows[-1] += ending_equity  # add terminal inflow to last month
+    return cashflows
+
+def irr_annual_from_monthly_cfs(cashflows, lower=-0.99, upper=10.0, iters=80):
+    """Bisection IRR on monthly cashflows; return ANNUALISED IRR. Robust for typical cases."""
+    def npv(rate):
+        return sum(cf / ((1 + rate) ** t) for t, cf in enumerate(cashflows))
+    lo, hi = lower, upper
+    for _ in range(iters):
+        mid = (lo + hi) / 2
+        v = npv(mid)
+        if v > 0:
+            lo = mid
+        else:
+            hi = mid
+    monthly = (lo + hi) / 2
+    return (1 + monthly) ** 12 - 1
+
 def simulate(inputs: Inputs) -> Results:
     # Compute once
     base = _compute_core(inputs)
@@ -313,104 +391,10 @@ def simulate(inputs: Inputs) -> Results:
     return Results(
         **{**base.__dict__, "breakeven_growth_simple": breakeven}
     )
-# Time series for charts
-def monthly_series(inputs: Inputs):
-    months = inputs.hold_years * 12
-    deposit = inputs.price * (1 - inputs.ltv)
-    loan = inputs.price - deposit
-    A = monthly_payment(loan, inputs.rate, inputs.term_years)
-
-    # Owner running monthly
-    if inputs.jurisdiction.upper() == "UK":
-        owner_extra_monthly = inputs.service_charge
-        rates_like_annual = 0.0
-        govrent_annual = 0.0
-    else:
-        owner_extra_monthly = inputs.mgmt_fee_psf * inputs.net_area_sqft + inputs.service_charge
-        rv_annual = inputs.rent * 12
-        rates_like_annual = inputs.hk_rates_override_annual if inputs.hk_rates_override_annual is not None else hk_rates_annual_from_rent(rv_annual)
-        govrent_annual = inputs.hk_govrent_override_annual if inputs.hk_govrent_override_annual is not None else hk_government_rent_annual(rv_annual)
-
-    maintenance_monthly = (inputs.maintenance_rate * inputs.price) / 12.0
-    owner_running_monthly = maintenance_monthly + owner_extra_monthly + (rates_like_annual/12.0) + (govrent_annual/12.0)
-
-    # Rent path (increase annually)
-    rent_by_month = []
-    current_rent = inputs.rent
-    for m in range(1, months+1):
-        rent_by_month.append(current_rent)
-        if m % 12 == 0:
-            current_rent *= (1 + inputs.rent_growth)
-
-    # Mortgage amortization
-    balances = [loan]
-    interest_by_month = []
-    principal_by_month = []
-    bal = loan
-    r = inputs.rate / 12.0
-    for _ in range(1, months+1):
-        interest = bal * r
-        principal = A - interest
-        bal = max(0.0, bal - principal)
-        interest_by_month.append(interest)
-        principal_by_month.append(principal)
-        balances.append(bal)
-
-    # Cumulative rent
-    cum_rent = []
-    s = 0.0
-    for x in rent_by_month:
-        s += x
-        cum_rent.append(s)
-
-    # One-offs
-    if inputs.jurisdiction.upper() == "UK":
-        stamp = sdlt_england_main_residence(inputs.price, surcharge=inputs.sdlt_surcharge) if inputs.sdlt_override is None else inputs.sdlt_override
-        agent_buy = 0.0
-    else:
-        stamp = hk_avd_scale2(inputs.price) if inputs.sdlt_override is None else inputs.sdlt_override
-        agent_buy = inputs.agent_buy_rate * inputs.price
-    buy_one_offs = stamp + inputs.buy_legal + agent_buy
-
-    # Cumulative buy (before equity refund)
-    cum_buy = []
-    s = deposit + buy_one_offs
-    for _ in range(months):
-        s += A + owner_running_monthly
-        cum_buy.append(s)
-
-    # Equity estimate over time
-    g_month = (1 + inputs.price_growth) ** (1/12) - 1 if inputs.price_growth != 0 else 0.0
-    price_path = []
-    p = inputs.price
-    for _ in range(1, months+1):
-        p *= (1 + g_month)
-        price_path.append(p)
-
-    sale_cost_rate = inputs.sell_fee_rate
-    equity_series = []
-    for m in range(months):
-        val = price_path[m]
-        bal = balances[m+1]
-        sale_cost_est = val * sale_cost_rate
-        equity = max(0.0, val - sale_cost_est - bal)
-        equity_series.append(equity)
-
-    monthly_owner_payment = [monthly_payment(loan, inputs.rate, inputs.term_years) + owner_running_monthly] * months
-
-    return pd.DataFrame({
-        "Month": list(range(1, months+1)),
-        "Monthly Rent": rent_by_month,
-        "Monthly Owner Outflow": monthly_owner_payment,
-        "Cumulative Rent": cum_rent,
-        "Cumulative Buy (pre-refund)": cum_buy,
-        "Estimated Equity": equity_series,
-    }).set_index("Month")
 
 # ------------------------- UI LAYOUT -------------------------
 
 st.title("🏠 Rent vs Buy — UK & Hong Kong")
-st.caption("Left: inputs. Right: breakdown (top) and charts (below).")
 
 left, right = st.columns([1, 3], gap="large")
 
@@ -421,25 +405,25 @@ with left:
     # Get defaults for selected jurisdiction
     defaults = DEFAULT_VALUES[jurisdiction]
 
-    price = st.number_input("Purchase price", min_value=0.0, value=defaults["price"], step=1000.0, format="%.2f")
-    rent = st.number_input("Current monthly rent", min_value=0.0, value=defaults["rent"], step=50.0, format="%.2f")
-    ltv = st.slider("Loan-to-value (LTV)", 0.0, 0.95, defaults["ltv"], 0.01)
-    rate = st.slider("Mortgage rate (annual %)", 0.0, 10.0, defaults["rate"], 0.05) / 100.0
-    term_years = st.slider("Mortgage term (years)", 5, 40, defaults["term_years"], 1)
-    hold_years = st.slider("Holding horizon (years)", 1, 15, defaults["hold_years"], 1)
+    price = st.number_input("Purchase price", min_value=0.0, value=defaults["price"], step=1000.0, format="%.0f", help="Total price of the property you're considering buying")
+    rent = st.number_input("Current monthly rent", min_value=0.0, value=defaults["rent"], step=50.0, format="%.0f", help="Monthly rent for a comparable property to the one you're buying")
+    ltv = st.slider("Loan-to-value (LTV)", 0.0, 0.95, defaults["ltv"], 0.01, help="Percentage of purchase price financed by mortgage (e.g., 0.80 = 80% mortgage, 20% down payment)")
+    rate = st.slider("Mortgage rate (annual %)", 0.0, 10.0, defaults["rate"], 0.05, help="Annual interest rate for your mortgage") / 100.0
+    term_years = st.slider("Mortgage term (years)", 5, 40, defaults["term_years"], 1, help="Length of mortgage repayment period")
+    hold_years = st.slider("Holding horizon (years)", 1, 15, defaults["hold_years"], 1, help="How long you plan to own the property before selling")
 
-    rent_growth = st.slider("Annual rent growth (%)", 0.0, 10.0, defaults["rent_growth"], 0.25) / 100.0
-    price_growth = st.slider("Annual price growth (%)", -10.0, 10.0, defaults["price_growth"], 0.25) / 100.0
-    opportunity_rate = st.slider("Opportunity rate (annual %, investable alt.)", 0.0, 10.0, defaults["opportunity_rate"], 0.25) / 100.0
+    rent_growth = st.slider("Annual rent growth (%)", 0.0, 10.0, defaults["rent_growth"], 0.25, help="Expected annual increase in rental prices") / 100.0
+    price_growth = st.slider("Annual price growth (%)", -10.0, 10.0, defaults["price_growth"], 0.25, help="Expected annual increase in property values") / 100.0
+    opportunity_rate = st.slider("Opportunity rate (annual %, investable alt.)", 0.0, 10.0, defaults["opportunity_rate"], 0.25, help="Rate of return you could earn by investing money elsewhere (e.g., stocks, bonds)") / 100.0
 
     st.markdown("#### Owner running & one-offs")
     if jurisdiction == "UK":
-        maintenance_rate = st.slider("Maintenance (annual % of price)", 0.0, 3.0, defaults["maintenance_rate"], 0.1) / 100.0
-        service_charge = st.number_input("Service/ground/estate charges (monthly)", min_value=0.0, value=defaults["service_charge"], step=10.0)
-        sdlt_surcharge = st.slider("SDLT surcharge (additional property)", 0.0, 5.0, defaults["sdlt_surcharge"], 0.5) / 100.0
-        buy_legal = st.number_input("Buyer legal/surveys", min_value=0.0, value=defaults["buy_legal"], step=100.0)
-        sell_fee_rate = st.slider("Selling costs (% of sale price)", 0.0, 3.0, defaults["sell_fee_rate"], 0.1) / 100.0
-        sdlt_override = st.number_input("Override SDLT (0 = auto)", min_value=0.0, value=0.0, step=100.0)
+        maintenance_rate = st.slider("Maintenance (annual % of price)", 0.0, 3.0, defaults["maintenance_rate"], 0.1, help="Annual maintenance costs as percentage of property value") / 100.0
+        service_charge = st.number_input("Service/ground/estate charges (monthly)", min_value=0.0, value=defaults["service_charge"], step=10.0, help="Monthly service charges, ground rent, or estate management fees")
+        sdlt_surcharge = st.slider("SDLT surcharge (additional property)", 0.0, 5.0, defaults["sdlt_surcharge"], 0.5, help="Additional SDLT rate if this is not your main residence (usually 3%)") / 100.0
+        buy_legal = st.number_input("Buyer legal/surveys", min_value=0.0, value=defaults["buy_legal"], step=100.0, help="Legal fees, surveys, and other costs when buying")
+        sell_fee_rate = st.slider("Selling costs (% of sale price)", 0.0, 3.0, defaults["sell_fee_rate"], 0.1, help="Estate agent fees and legal costs when selling (typically 1-2%)") / 100.0
+        sdlt_override = st.number_input("Override SDLT (0 = auto)", min_value=0.0, value=0.0, step=100.0, help="Manual SDLT amount (leave 0 for automatic calculation based on price)")
         sdlt_override_val = None if sdlt_override == 0 else sdlt_override
         agent_buy_rate = 0.0
         mgmt_fee_psf = 0.0
@@ -447,15 +431,15 @@ with left:
         hk_rates_override_val = None
         hk_govrent_override_val = None
     else:
-        maintenance_rate = st.slider("Maintenance (annual % of price)", 0.0, 3.0, defaults["maintenance_rate"], 0.1) / 100.0
-        mgmt_fee_psf = st.number_input("Management fee (HKD/ft²/mo)", min_value=0.0, value=defaults["mgmt_fee_psf"], step=0.1)
-        net_area_sqft = st.number_input("Net area (ft²)", min_value=0.0, value=defaults["net_area_sqft"], step=10.0)
-        buy_legal = st.number_input("Buyer legal/misc (HKD)", min_value=0.0, value=defaults["buy_legal"], step=500.0)
-        agent_buy_rate = st.slider("Buyer agent fee (% of price)", 0.0, 2.0, defaults["agent_buy_rate"], 0.1) / 100.0
-        sell_fee_rate = st.slider("Selling costs (% of sale price)", 0.0, 3.0, defaults["sell_fee_rate"], 0.1) / 100.0
-        sdlt_override = st.number_input("Override AVD (0 = auto)", min_value=0.0, value=0.0, step=1000.0)
-        hk_rates_override = st.number_input("Override HK Rates (annual, 0=auto)", min_value=0.0, value=0.0, step=100.0)
-        hk_govrent_override = st.number_input("Override Gov't Rent (annual, 0=auto)", min_value=0.0, value=0.0, step=100.0)
+        maintenance_rate = st.slider("Maintenance (annual % of price)", 0.0, 3.0, defaults["maintenance_rate"], 0.1, help="Annual maintenance costs as percentage of property value") / 100.0
+        mgmt_fee_psf = st.number_input("Management fee (HKD/ft²/mo)", min_value=0.0, value=defaults["mgmt_fee_psf"], step=0.1, help="Monthly management fees charged per square foot")
+        net_area_sqft = st.number_input("Net area (ft²)", min_value=0.0, value=defaults["net_area_sqft"], step=10.0, help="Net floor area of the property in square feet")
+        buy_legal = st.number_input("Buyer legal/misc (HKD)", min_value=0.0, value=defaults["buy_legal"], step=500.0, help="Legal fees and miscellaneous costs when buying")
+        agent_buy_rate = st.slider("Buyer agent fee (% of price)", 0.0, 2.0, defaults["agent_buy_rate"], 0.1, help="Real estate agent commission when buying (typically 1%)") / 100.0
+        sell_fee_rate = st.slider("Selling costs (% of sale price)", 0.0, 3.0, defaults["sell_fee_rate"], 0.1, help="Agent fees and legal costs when selling (typically 2%)") / 100.0
+        sdlt_override = st.number_input("Override AVD (0 = auto)", min_value=0.0, value=0.0, step=1000.0, help="Manual Ad Valorem Duty amount (leave 0 for automatic calculation)")
+        hk_rates_override = st.number_input("Override HK Rates (annual, 0=auto)", min_value=0.0, value=0.0, step=100.0, help="Manual annual rates amount (leave 0 for automatic calculation based on rateable value)")
+        hk_govrent_override = st.number_input("Override Gov't Rent (annual, 0=auto)", min_value=0.0, value=0.0, step=100.0, help="Manual annual government rent amount (leave 0 for automatic calculation)")
         sdlt_override_val = None if sdlt_override == 0 else sdlt_override
         service_charge = 0.0
         sdlt_surcharge = 0.0
@@ -475,94 +459,22 @@ with left:
 with right:
     res = simulate(inputs)
     cur = "£" if jurisdiction == "UK" else "$"
-
-    # ---- Formulas (dropdown) ----
-    with st.expander("📐 View Calculation Formulas & Methodology"):
-        # Simple mode formulas
-        st.markdown("**Simple Mode (Cash-Only Analysis):**")
-        st.markdown("This mode only considers actual cash flows without opportunity costs.")
-        st.latex(r"""
-        \text{Net Cost Owning} = \text{Deposit} + \text{Buy Fees} + \text{Mortgage Payments} + \text{Running Costs} - \text{Equity Returned}
-        """)
-        st.latex(r"""
-        \text{Net Cost Renting} = \sum_{t=1}^{T} \text{Rent}_t \times (1 + g_r)^{t-1}
-        """)
-        
-        st.markdown("---")
-        
-        # Opportunity cost methodology
-        st.markdown("**Opportunity-Adjusted Mode (Investment Alternative Analysis):**")
-        st.markdown("""
-        This mode considers what you could earn by investing your money elsewhere at the opportunity rate.
-        
-        **Key Concept:** When you buy a property, you tie up capital that could be invested. When you rent, 
-        you can invest the down payment and buying costs in alternative investments.
-        """)
-        
-        st.markdown("**Buying Scenario Opportunity Costs:**")
-        st.markdown("1. **Down Payment Opportunity Cost:** What the down payment would earn if invested")
-        st.latex(r"""
-        \text{Down Payment OC} = \text{Deposit} \times [(1 + r_{opp})^T - 1]
-        """)
-        
-        st.markdown("2. **Upfront Costs Opportunity Cost:** What buying fees would earn if invested")
-        st.latex(r"""
-        \text{Buy Costs OC} = \text{Buy Fees} \times [(1 + r_{opp})^T - 1]
-        """)
-        
-        st.markdown("3. **Monthly Payments Opportunity Cost:** What monthly mortgage+running costs would earn if invested")
-        st.latex(r"""
-        \text{Monthly OC} = \text{FV}(\text{Monthly Payments}, r_{opp}) - \sum \text{Monthly Payments}
-        """)
-        
-        st.markdown("**Renting Scenario:**")
-        st.markdown("1. **Rent Opportunity Cost:** What rent payments would earn if invested instead")
-        st.latex(r"""
-        \text{Rent OC} = \text{FV}(\text{Rent Payments}, r_{opp}) - \sum \text{Rent Payments}
-        """)
-        
-        st.markdown("2. **Alternative Investment Benefit:** Renter invests down payment + buy costs")
-        st.latex(r"""
-        \text{Alt Investment} = (\text{Deposit} + \text{Buy Fees}) \times (1 + r_{opp})^T
-        """)
-        
-        st.markdown("**Final Opportunity-Adjusted Costs:**")
-        st.latex(r"""
-        \text{Net Cost Owning}_{opp} = \text{Net Cost Owning} + \text{All Buying OCs}
-        """)
-        st.latex(r"""
-        \text{Net Cost Renting}_{opp} = \text{Net Cost Renting} + \text{Rent OC} - \text{Alt Investment Gains}
-        """)
-        
-        st.markdown("**Where:**")
-        st.markdown("- $r_{opp}$ = Annual opportunity rate")
-        st.markdown("- $T$ = Holding period in years") 
-        st.markdown("- $\\text{FV}(\\cdot)$ = Future value of payment stream")
-        st.markdown("- OC = Opportunity Cost")
-
-    # ---- Breakdown (top area) ----
-    st.markdown("### Breakdown")
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Deposit", f"{cur}{inputs.price*(1-inputs.ltv):,.0f}")
-    m2.metric("Upfront taxes & fees", f"{cur}{res.buy_one_offs:,.0f}")
-    m3.metric("Interest paid (horizon)", f"{cur}{res.interest_paid:,.0f}")
-    m4.metric("Principal repaid (horizon)", f"{cur}{res.principal_paid:,.0f}")
-
-    m5, m6, m7, m8 = st.columns(4)
-    m5.metric("Owner running (horizon)", f"{cur}{res.owner_running:,.0f}")
-    m6.metric("Sale price (horizon)", f"{cur}{res.final_sale_price:,.0f}")
-    m7.metric("Sale costs", f"{cur}{res.sale_costs:,.0f}")
-    m8.metric("Mortgage balance at sale", f"{cur}{res.outstanding_balance:,.0f}")
-
-    st.markdown(f"**Breakeven annual price growth (simple, over {inputs.hold_years}y):** {res.breakeven_growth_simple:.2%}")
     # ---- Summary verdict box ----
-    st.markdown("#### Summary verdict")
+    st.markdown("### Summary verdict")
     basis = st.radio("Assess using", ["Simple (cash only)", "Opportunity-adjusted"], horizontal=True, key="basis_radio")
+    
+    if basis.startswith("Simple"):
+        st.caption("Simple Mode: Economic profit (excludes principal as expense; includes interest, running, buy/sell costs; no discounting; pre-tax).")
+    else:
+        st.caption("Opportunity-Adjusted Mode: Economic profit with opportunity costs on tied-up capital and rent payments.")
+    
     if basis.startswith("Simple"):
         diff = res.net_cost_owning_simple - res.net_cost_renting_simple
         owning = res.net_cost_owning_simple
         renting = res.net_cost_renting_simple
     else:
+        if res.net_cost_owning_opp is None or res.net_cost_renting_opp is None:
+            raise ValueError("Opportunity costs not calculated")
         diff = res.net_cost_owning_opp - res.net_cost_renting_opp
         owning = res.net_cost_owning_opp
         renting = res.net_cost_renting_opp
@@ -581,19 +493,18 @@ with right:
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        st.metric("Owning", f"{cur}{owning:,.0f}")
+        st.metric("Owning", f"{cur}{owning:,.0f}", help=f"Total net cost of owning over {inputs.hold_years} years")
     
     with col2:
-        st.metric("Renting", f"{cur}{renting:,.0f}")
+        st.metric("Renting", f"{cur}{renting:,.0f}", help=f"Total cost of renting over {inputs.hold_years} years")
     
     with col3:
-        # Color coding for difference - green if positive, red if negative
         if abs(diff) <= eps:
-            color = "#262730"  # default text color
+            color = "#262730"
         elif diff > 0:
-            color = "#00C851"  # green for positive (owning more expensive)
+            color = "#00C851"
         else:
-            color = "#FF4444"  # red for negative (renting more expensive)
+            color = "#FF4444"
         
         st.markdown(f'<p style="font-size:14px; color:#8892b0; margin:0;">Difference</p>', unsafe_allow_html=True)
         st.markdown(f'<p style="font-size:36px; font-weight:600; color:{color}; margin:0; line-height:1;">{cur}{diff:,.0f}</p>', unsafe_allow_html=True)
@@ -620,6 +531,22 @@ with right:
         renter_alt_investment_total = (deposit + buy_one_offs) * ((1 + inputs.opportunity_rate) ** inputs.hold_years)
         renter_alt_investment_gains = renter_alt_investment_total - (deposit + buy_one_offs)
         
+        # Recompute rent opportunity cost for display (mirror _compute_core logic)
+        months = inputs.hold_years * 12
+        r_m = inputs.opportunity_rate / 12.0
+        current_rent = inputs.rent
+        fv_rent_stream = 0.0
+        sum_rent = 0.0
+        for m in range(1, months + 1):
+            sum_rent += current_rent
+            months_remaining = months - m
+            fv_rent_stream += current_rent * ((1 + r_m) ** months_remaining)
+            if m % 12 == 0:
+                current_rent *= (1 + inputs.rent_growth)
+
+        rent_opportunity_cost_display = fv_rent_stream - sum_rent
+        net_benefit_to_renter = renter_alt_investment_gains - rent_opportunity_cost_display
+        
         st.markdown("**Buying Scenario Adjustments:**")
         col1, col2 = st.columns(2)
         with col1:
@@ -630,14 +557,15 @@ with right:
             st.caption(f"What {cur}{buy_one_offs:,.0f} in buying fees would earn at {inputs.opportunity_rate:.1%}/year")
         
         st.markdown("**Renting Scenario Adjustments:**")
-        col1, col2 = st.columns(2)
+        # Show both components + net
+        col1, col2, col3 = st.columns(3)
         with col1:
-            st.metric("Alternative Investment Gains", f"{cur}{renter_alt_investment_gains:,.0f}")
-            st.caption(f"Gains from investing {cur}{deposit + buy_one_offs:,.0f} at {inputs.opportunity_rate:.1%}/year")
+            st.metric("Investment gains on deposit + fees", f"{cur}{renter_alt_investment_gains:,.0f}")
         with col2:
-            net_benefit_to_renter = renter_alt_investment_gains
-            st.metric("Net Benefit to Renter", f"{cur}{net_benefit_to_renter:,.0f}")
-            st.caption("Total investment gains reduce renting costs")
+            st.metric("Opportunity cost on rent stream", f"{cur}{rent_opportunity_cost_display:,.0f}")
+        with col3:
+            st.metric("Net Benefit to Renter (opportunity)", f"{cur}{net_benefit_to_renter:,.0f}")
+        st.caption("Net = gains from investing the initial lump sum minus the opportunity cost applied to the rent stream.")
         
         st.markdown("---")
         st.markdown("**Interpretation:**")
@@ -649,11 +577,164 @@ with right:
             """)
         else:
             st.markdown("- With 0% opportunity rate, both modes show the same results (no alternative investment consideration)")
-    
-    
 
-    # ---- Charts (remaining area) ----
+
+
+    # ---- Breakdown (top area) ----
+    st.markdown("### Breakdown")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Deposit", f"{cur}{inputs.price*(1-inputs.ltv):,.0f}", border=True, help="Down payment required upfront")
+    m2.metric("Upfront taxes & fees", f"{cur}{res.buy_one_offs:,.0f}", border=True, help="One-time costs when purchasing: stamp duty, legal fees, surveys")
+    m3.metric("Interest paid (horizon)", f"{cur}{res.interest_paid:,.0f}", border=True, help=f"Total mortgage interest payments over {inputs.hold_years} years")
+    m4.metric("Principal repaid (horizon)", f"{cur}{res.principal_paid:,.0f}", border=True, help=f"Mortgage principal paid down over {inputs.hold_years} years")
+
+    m5, m6, m7, m8 = st.columns(4)
+    m5.metric("Owner running (horizon)", f"{cur}{res.owner_running:,.0f}", border=True, help=f"Ongoing costs over {inputs.hold_years} years: maintenance, service charges, insurance")
+    m6.metric("Estimated Sale costs", f"{cur}{res.sale_costs:,.0f}", border=True, help="Estate agent fees and legal costs when selling")
+    m7.metric("Mortgage balance at sale", f"{cur}{res.outstanding_balance:,.0f}", border=True, help=f"Remaining mortgage debt after {inputs.hold_years} years")
+
+    # Sale Analysis Section
+    st.markdown("### Sale Analysis")
+    st.caption("Economic profit shown above treats principal as equity, not expense (no discounting, pre-tax). Equity IRR uses cash flows (including principal timing) and provides a time-weighted return on equity.")
     
+    # Calculate percentage changes for deltas
+    price_change_pct = ((res.final_sale_price - inputs.price) / inputs.price) * 100
+    net_sale_change_pct = ((res.net_sale_price - inputs.price) / inputs.price) * 100
+    net_gain = res.net_gain_after_sale(inputs.price, inputs.ltv)
+    
+    # Equity contributed = deposit + cumulative principal repaid
+    deposit = inputs.price * (1 - inputs.ltv)
+    equity_contributed = deposit + res.principal_paid
+    ending_equity = res.net_sale_price - res.outstanding_balance
+    equity_multiple = (ending_equity / equity_contributed) if equity_contributed > 0 else float("nan")
+
+    # IRR on equity cash flows
+    owner_cfs = build_owner_cashflows_for_irr(inputs, res)
+    equity_irr_annual = irr_annual_from_monthly_cfs(owner_cfs)
+    
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("Sale price (horizon)", f"{cur}{res.final_sale_price:,.0f}", 
+              delta=f"{price_change_pct:+.1f}%", border=True, 
+              help=f"Expected property value after {inputs.hold_years} years of growth")
+    s2.metric("Net sale price", f"{cur}{res.net_sale_price:,.0f}", 
+              delta=f"{net_sale_change_pct:+.1f}%", border=True,
+              help="Sale price after deducting selling costs")
+    s3.metric("Net gain after sale", f"{cur}{net_gain:,.0f}", 
+              delta=f"{(net_gain/inputs.price)*100:+.1f}%" if net_gain != 0 else "0.0%", border=True,
+              help="Economic profit (excludes principal as expense; includes interest, running, buy/sell costs; no discounting; pre-tax)")
+    s4.metric("Equity Multiple", f"{equity_multiple:,.2f}", border=True,
+              help="(Ending equity) / (Deposit + Principal repaid)")
+    
+    # Add a new row for IRR
+    st.metric("Equity IRR (annual)", f"{equity_irr_annual:.2%}",
+              help="IRR computed on owner equity cash flows (principal treated as capital, not expense). Equity IRR reflects actual cash flow timing (principal included in cash flows), annualised.")
+
+    st.markdown(f"**Breakeven annual price growth (simple, over {inputs.hold_years}y):** {res.breakeven_growth_simple:.2%}")
+
+# ---- FAQ Section ----
+st.markdown("---")
+st.markdown("## ❓ FAQ")
+
+with st.expander("📐 How are the calculations performed?"):
+    # Simple mode formulas
+    st.markdown("**Simple Mode (Cash-Only Analysis):**")
+    st.markdown("This mode only considers actual cash flows without opportunity costs.")
+    st.latex(r"""
+    \text{Net Cost Owning} = \text{Deposit} + \text{Buy Fees} + \text{Mortgage Payments} + \text{Running Costs} - \text{Equity Returned}
+    """)
+    st.latex(r"""
+    \text{Net Cost Renting} = \sum_{t=1}^{T} \text{Rent}_t \times (1 + g_r)^{t-1}
+    """)
+    
+    st.markdown("---")
+    
+    # Opportunity cost methodology
+    st.markdown("**Opportunity-Adjusted Mode (Investment Alternative Analysis):**")
+    st.markdown("""
+    This mode considers what you could earn by investing your money elsewhere at the opportunity rate.
+    
+    **Key Concept:** When you buy a property, you tie up capital that could be invested. When you rent, 
+    you can invest the down payment and buying costs in alternative investments.
+    """)
+    
+    st.markdown("**Buying Scenario Opportunity Costs:**")
+    st.markdown("1. **Down Payment Opportunity Cost:** What the down payment would earn if invested")
+    st.latex(r"""
+    \text{Down Payment OC} = \text{Deposit} \times [(1 + r_{opp})^T - 1]
+    """)
+    
+    st.markdown("2. **Upfront Costs Opportunity Cost:** What buying fees would earn if invested")
+    st.latex(r"""
+    \text{Buy Costs OC} = \text{Buy Fees} \times [(1 + r_{opp})^T - 1]
+    """)
+    
+    st.markdown("3. **Monthly Payments Opportunity Cost:** What monthly mortgage+running costs would earn if invested")
+    st.latex(r"""
+    \text{Monthly OC} = \text{FV}(\text{Monthly Payments}, r_{opp}) - \sum \text{Monthly Payments}
+    """)
+    
+    st.markdown("**Renting Scenario:**")
+    st.markdown("1. **Rent Opportunity Cost:** What rent payments would earn if invested instead")
+    st.latex(r"""
+    \text{Rent OC} = \text{FV}(\text{Rent Payments}, r_{opp}) - \sum \text{Rent Payments}
+    """)
+    
+    st.markdown("2. **Alternative Investment Benefit:** Renter invests down payment + buy costs")
+    st.latex(r"""
+    \text{Alt Investment} = (\text{Deposit} + \text{Buy Fees}) \times (1 + r_{opp})^T
+    """)
+    
+    st.markdown("**Final Opportunity-Adjusted Costs:**")
+    st.latex(r"""
+    \text{Net Cost Owning}_{opp} = \text{Net Cost Owning} + \text{All Buying OCs}
+    """)
+    st.latex(r"""
+    \text{Net Cost Renting}_{opp} = \text{Net Cost Renting} + \text{Rent OC} - \text{Alt Investment Gains}
+    """)
+    
+    st.markdown("**Where:**")
+    st.markdown("- $r_{opp}$ = Annual opportunity rate")
+    st.markdown("- $T$ = Holding period in years") 
+    st.markdown("- $\\text{FV}(\\cdot)$ = Future value of payment stream")
+    st.markdown("- OC = Opportunity Cost")
+
+with st.expander("🏠 What's the difference between UK and Hong Kong modes?"):
+    st.markdown("**UK Mode includes:**")
+    st.markdown("- SDLT (Stamp Duty Land Tax) calculations with main residence rates")
+    st.markdown("- Optional SDLT surcharge for additional properties")
+    st.markdown("- Service charges, ground rent, and estate management fees")
+    st.markdown("- Legal fees and surveys")
+    
+    st.markdown("**Hong Kong Mode includes:**")
+    st.markdown("- AVD (Ad Valorem Duty) using Scale 2 rates")
+    st.markdown("- Management fees calculated per square foot")
+    st.markdown("- Government rent and rates calculations")
+    st.markdown("- Buyer agent commissions")
+
+with st.expander("💰 What does 'opportunity rate' mean?"):
+    st.markdown("""
+    The opportunity rate represents the return you could earn by investing your money elsewhere instead of buying property.
+    
+    **Examples:**
+    - 3-4%: Government bonds or high-yield savings
+    - 5-7%: Diversified index funds (long-term average)
+    - 8-10%: Stock market (higher risk, higher potential return)
+    
+    **Why it matters:** When you buy property, you tie up capital (down payment + fees) that could be invested elsewhere. 
+    The opportunity-adjusted mode accounts for this by comparing what you could earn from alternative investments.
+    """)
+
+with st.expander("📊 How should I interpret the results?"):
+    st.markdown("""
+    **Simple Mode:** Pure cash flow comparison - which option costs you less out of pocket over the holding period.
+    
+    **Opportunity-Adjusted Mode:** More sophisticated analysis that considers investment alternatives. Use this if you're 
+    comfortable with investing and want to account for the opportunity cost of tying up capital in property.
+    
+    **The verdict:** Shows which option is financially better based on your inputs. Remember this is just one factor 
+    in your decision - also consider lifestyle preferences, risk tolerance, and market timing.
+    """)
+
 st.download_button(
     "Download scenario JSON",
     data=str(inputs.__dict__),
