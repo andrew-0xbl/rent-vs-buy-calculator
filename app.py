@@ -2,6 +2,9 @@ from dataclasses import dataclass
 from typing import Optional
 import streamlit as st
 import pandas as pd
+import numpy as np
+import altair as alt
+from copy import deepcopy
 
 st.set_page_config(page_title="Rent vs Buy (UK & Hong Kong)", page_icon="🏠", layout="wide")
 
@@ -33,7 +36,7 @@ DEFAULT_VALUES = {
         "rent_growth": 1.0,  # percentage
         "price_growth": 1.0,  # percentage
         "opportunity_rate": 2.5,  # percentage
-        "maintenance_rate": 0.30,  # percentage
+        "maintenance_rate": 0.50,  # percentage
         "mgmt_fee_psf": 5.5,
         "net_area_sqft": 350.0,
         "buy_legal": 15000.0,
@@ -413,6 +416,180 @@ def horizon_profile_dataframe(inputs: Inputs, max_years: int = 30) -> pd.DataFra
         "Net Gain After Sale (%)": gain_vals_pct,
     })
 
+# --- A1. Breakeven appreciation (two flavors) ---
+
+def breakeven_price_growth_simple(inputs: Inputs, tol=1e-6, lo=-0.20, hi=0.20, iters=60):
+    """Solve for annual price growth where SIMPLE net costs are equal: own == rent."""
+    def diff_at(g):
+        tmp = Inputs(**{**inputs.__dict__, "price_growth": g})
+        r = _compute_core(tmp)
+        return r.net_cost_owning_simple - r.net_cost_renting_simple
+    a, b = lo, hi
+    fa, fb = diff_at(a), diff_at(b)
+    # Expand if needed
+    k = 0
+    while fa*fb > 0 and k < 8:
+        a -= 0.05; b += 0.05
+        fa, fb = diff_at(a), diff_at(b); k += 1
+    for _ in range(iters):
+        m = 0.5*(a+b)
+        fm = diff_at(m)
+        if abs(fm) < tol: return m
+        if fa*fm <= 0:
+            b, fb = m, fm
+        else:
+            a, fa = m, fm
+    return 0.5*(a+b)
+
+def breakeven_price_growth_irr_nonnegative(inputs: Inputs, tol=1e-6, lo=-0.20, hi=0.20, iters=60):
+    """Solve for annual price growth where Equity IRR crosses 0%."""
+    def irr_at(g):
+        tmp = Inputs(**{**inputs.__dict__, "price_growth": g})
+        r = simulate(tmp)
+        cfs = build_owner_cashflows_for_irr(tmp, r)
+        return irr_annual_from_monthly_cfs(cfs)
+    a, b = lo, hi
+    fa, fb = irr_at(a), irr_at(b)
+    k = 0
+    while (fa < 0 and fb < 0) or (fa > 0 and fb > 0):
+        a -= 0.05; b += 0.05
+        fa, fb = irr_at(a), irr_at(b); k += 1
+        if k > 8: break
+    for _ in range(iters):
+        m = 0.5*(a+b)
+        fm = irr_at(m)
+        if abs(fm) < 1e-5: return m
+        if (fa <= 0 and fm >= 0) or (fa >= 0 and fm <= 0):
+            b, fb = m, fm
+        else:
+            a, fa = m, fm
+    return 0.5*(a+b)
+
+# --- A2. HK Rates / Gov Rent toggle calculators (used if auto) ---
+
+def hk_rates_and_govrent_from_rent_monthly(rent_monthly: float):
+    rv_annual = rent_monthly * 12.0
+    rates_annual = hk_rates_annual_from_rent(rv_annual)   # your existing stepped function
+    govrent_annual = hk_government_rent_annual(rv_annual) # 3% of RV
+    return rates_annual/12.0, govrent_annual/12.0
+
+# --- A3. Wealth trajectories (month-by-month) ---
+
+def wealth_trajectories(inputs: Inputs):
+    """Return DataFrame with years, Buy_NetWorth, Rent_Investor_Wealth (FV basis and level cash).
+       Buy_NetWorth(t): property_value(t) - mortgage_balance(t) - (optional sale cost fraction at t -> 0 mid-hold).
+       Rent_Investor_Wealth(t): FV of initial (deposit+fees) plus FV of monthly deltas (rent cheaper than own).
+       We keep sale costs out during hold (only at terminal) to avoid artificial dips mid-hold.
+    """
+    months = inputs.hold_years * 12
+    dep = inputs.price * (1 - inputs.ltv)
+    loan = inputs.price - dep
+    r_m = inputs.rate/12.0
+    opp_m = inputs.opportunity_rate/12.0
+
+    # Property path
+    price_path = [inputs.price * ((1 + inputs.price_growth) ** (t/12.0)) for t in range(months+1)]
+
+    # Mortgage balance path
+    A = monthly_payment(loan, inputs.rate, inputs.term_years)
+    bal = loan
+    balances = [bal]
+    for _ in range(months):
+        interest = bal * r_m
+        principal = A - interest
+        bal = max(0.0, bal - principal)
+        balances.append(bal)
+
+    # Owner running monthly (mirror _compute_core)
+    if inputs.jurisdiction.upper() == "UK":
+        owner_extra_monthly = inputs.service_charge
+        rates_m = 0.0; govrent_m = 0.0
+    else:
+        rates_m, govrent_m = hk_rates_and_govrent_from_rent_monthly(inputs.rent) \
+            if (inputs.hk_rates_override_annual is None and inputs.hk_govrent_override_annual is None) \
+            else ((inputs.hk_rates_override_annual or 0.0)/12.0, (inputs.hk_govrent_override_annual or 0.0)/12.0)
+        owner_extra_monthly = inputs.mgmt_fee_psf * inputs.net_area_sqft + inputs.service_charge
+
+    maint_m = (inputs.maintenance_rate * inputs.price) / 12.0
+    owner_running_m = maint_m + owner_extra_monthly + rates_m + govrent_m
+
+    # Buy net worth path (in level dollars, not FV) during hold:
+    buy_networth = []
+    for t in range(months+1):
+        eq = price_path[t] - balances[t]
+        buy_networth.append(eq)
+
+    # Rent investor wealth path (FV basis):
+    # FV of initial (dep + buy_one_offs)
+    if inputs.jurisdiction.upper() == "UK":
+        tax_buy = sdlt_england_main_residence(inputs.price, surcharge=inputs.sdlt_surcharge) \
+                  if inputs.sdlt_override is None else inputs.sdlt_override
+        buy_one_offs = tax_buy + inputs.buy_legal
+    else:
+        tax_buy = hk_avd_scale2(inputs.price) if inputs.sdlt_override is None else inputs.sdlt_override
+        buy_one_offs = tax_buy + inputs.buy_legal + inputs.agent_buy_rate*inputs.price
+
+    lump = dep + buy_one_offs
+    wealth_rent = []
+    FV_lump = lump  # will compound forward
+    rent_level = inputs.rent
+    for t in range(months+1):
+        # compound lump
+        if t > 0:
+            FV_lump *= (1 + opp_m)
+        # monthly delta (if renting cheaper than owning)
+        owner_monthly = A + owner_running_m
+        monthly_saving = max(0.0, owner_monthly - rent_level)  # money renter can invest
+        # invest saving at end of each month
+        if t > 0:
+            FV_lump += monthly_saving
+        wealth_rent.append(FV_lump)
+        # step rent annually
+        if t > 0 and t % 12 == 0:
+            rent_level *= (1 + inputs.rent_growth)
+
+    # Sample data points at year boundaries only (whole numbers)
+    year_indices = [t for t in range(months+1) if t % 12 == 0]  # 0, 12, 24, 36, etc.
+    year_numbers = [t // 12 for t in year_indices]  # 0, 1, 2, 3, etc.
+    year_buy_networth = [buy_networth[i] for i in year_indices]
+    year_wealth_rent = [wealth_rent[i] for i in year_indices]
+    
+    df = pd.DataFrame({
+        "Years": year_numbers,  # Whole number years
+        "Buy_NetWorth": year_buy_networth,
+        "Rent_Investor_Wealth_FV": year_wealth_rent
+    })
+    return df
+
+# --- A4. Equivalent Monthly Cost (EAC) on FV basis ---
+
+def equivalent_monthly_cost_from_fv(total_fv_cost: float, months: int, opp_annual: float):
+    """Convert end-of-horizon FV cost into a level monthly 'equivalent' using the FV annuity factor."""
+    r = opp_annual / 12.0
+    if months == 0:
+        return 0.0
+    if r == 0:
+        return total_fv_cost / months
+    fv_annuity_factor = ((1 + r)**months - 1) / r
+    return total_fv_cost / fv_annuity_factor
+
+# --- A5. Ownership cost breakdown for stacked bar (small chart) ---
+
+def ownership_cost_breakdown(inputs: Inputs, res: Results):
+    """Return DataFrame with categories and amounts for pie chart."""
+    # Create data with categories and amounts
+    data = {
+        "Category": ["Deposit", "Buy taxes & legal", "Interest", "Maintenance", "Sale costs"],
+        "Amount": [
+            inputs.price*(1-inputs.ltv),
+            res.buy_one_offs,
+            res.interest_paid,
+            res.owner_running,
+            res.sale_costs
+        ]
+    }
+    return pd.DataFrame(data)
+
 # ------------------------- UI LAYOUT -------------------------
 
 st.title("🏠 Rent vs Buy — UK & Hong Kong")
@@ -459,13 +636,24 @@ with left:
         agent_buy_rate = st.slider("Buyer agent fee (% of price)", 0.0, 2.0, defaults["agent_buy_rate"], 0.1, help="Real estate agent commission when buying (typically 1%)") / 100.0
         sell_fee_rate = st.slider("Selling costs (% of sale price)", 0.0, 3.0, defaults["sell_fee_rate"], 0.1, help="Agent fees and legal costs when selling (typically 2%)") / 100.0
         sdlt_override = st.number_input("Override AVD (Simplified) (0 = auto)", min_value=0.0, value=0.0, step=1000.0, help="Manual Ad Valorem Duty amount (leave 0 for automatic calculation)")
-        hk_rates_override = st.number_input("Override HK Rates (annual, 0=auto)", min_value=0.0, value=0.0, step=100.0, help="Manual annual rates amount (leave 0 for automatic calculation based on rateable value)")
-        hk_govrent_override = st.number_input("Override Gov't Rent (annual, 0=auto)", min_value=0.0, value=0.0, step=100.0, help="Manual annual government rent amount (leave 0 for automatic calculation)")
+        
+        # HK Rates & Government Rent toggle
+        auto_rates = st.checkbox("Auto-calc Rates & Gov't Rent from rent", value=True,
+                                help="If checked, uses current rent to estimate rateable value. Otherwise, enter annual amounts manually.")
+        
+        if auto_rates:
+            hk_rates_override_val = None
+            hk_govrent_override_val = None
+            st.caption("Using auto: Rates ≈ stepped % of RV; Gov't Rent = 3% of RV. RV derived from current rent.")
+        else:
+            hk_rates_override = st.number_input("HK Rates (annual)", min_value=0.0, value=0.0, step=100.0)
+            hk_govrent_override = st.number_input("Gov't Rent (annual)", min_value=0.0, value=0.0, step=100.0)
+            hk_rates_override_val = hk_rates_override
+            hk_govrent_override_val = hk_govrent_override
+        
         sdlt_override_val = None if sdlt_override == 0 else sdlt_override
         service_charge = 0.0
         sdlt_surcharge = 0.0
-        hk_rates_override_val = None if hk_rates_override == 0 else hk_rates_override
-        hk_govrent_override_val = None if hk_govrent_override == 0 else hk_govrent_override
 
     inputs = Inputs(
         jurisdiction=jurisdiction, price=price, rent=rent, ltv=ltv, rate=rate,
@@ -660,6 +848,149 @@ with right:
     hp_df = horizon_profile_dataframe(inputs, max_years=30)
     st.line_chart(hp_df.set_index("Horizon (yrs)"), use_container_width=True)
     st.caption("Equity IRR is annualised and cashflow-based (includes principal timing). Net Gain After Sale is an economic profit (% of purchase price) that excludes principal as an expense but includes interest, running, and transaction costs.")
+
+    # ---- Breakeven Calculators ----
+    st.markdown("### Breakeven Calculators")
+    bcol1, bcol2 = st.columns(2)
+    with bcol1:
+        g_simple = breakeven_price_growth_simple(inputs)
+        st.metric("Breakeven price growth (Simple)", f"{g_simple:.2%}",
+                  help="Annual property growth where simple net costs are equal (own = rent).", border=True)
+    with bcol2:
+        g_irr0 = breakeven_price_growth_irr_nonnegative(inputs)
+        st.metric("Breakeven price growth (IRR = 0%)", f"{g_irr0:.2%}",
+                  help="Annual property growth where equity IRR crosses 0%.", border=True)
+
+    # ---- Consumption Premium & Equivalent Monthly Cost ----
+    st.markdown("### Consumption Premium & Equivalent Monthly Cost")
+    months = inputs.hold_years * 12
+    # Use OPPORTUNITY-ADJUSTED totals for EAC on FV basis (consistent with your app's FV opportunity framing)
+    own_fv = res.net_cost_owning_opp if res.net_cost_owning_opp is not None else res.net_cost_owning_simple
+    rent_fv = res.net_cost_renting_opp if res.net_cost_renting_opp is not None else res.net_cost_renting_simple
+    eac_own = equivalent_monthly_cost_from_fv(own_fv, months, inputs.opportunity_rate)
+    eac_rent = equivalent_monthly_cost_from_fv(rent_fv, months, inputs.opportunity_rate)
+    consumption_premium = eac_own - eac_rent  # >0 means paying extra per month to own vs rent
+
+    p1, p2, p3, p4 = st.columns(4)
+    cur = "£" if inputs.jurisdiction == "UK" else "$"
+    with p1: st.metric("Equivalent Monthly Cost — Own", f"{cur}{eac_own:,.0f}", border=True)
+    with p2: st.metric("Equivalent Monthly Cost — Rent", f"{cur}{eac_rent:,.0f}", border=True)
+    with p3:
+        st.metric("Consumption Premium (per month)", f"{cur}{consumption_premium:,.0f}",
+                  help="Positive = you pay this extra per month to own (for stability/lifestyle).", border=True)
+    with p4:
+        # Calculate percentage difference
+        if eac_rent != 0:
+            premium_pct = (consumption_premium / eac_rent) * 100
+        else:
+            premium_pct = 0
+        
+        # Determine color based on premium
+        if abs(premium_pct) < 0.1:  # Very close to zero
+            color = "#FFA500"  # Orange/Yellow
+        elif premium_pct > 0:  # Own more expensive
+            color = "#00C851"  # Green
+        else:  # Rent more expensive
+            color = "#FF4444"  # Red
+        
+        st.markdown(f'<p style="font-size:14px; color:#8892b0; margin:0;">Own Premium Percentage</p>', unsafe_allow_html=True)
+        st.markdown(f'<p style="font-size:28px; font-weight:600; color:{color}; margin:0; line-height:1;">{premium_pct:+.1f}%</p>', unsafe_allow_html=True)
+
+    # ---- Charts Row: Wealth Trajectory and Ownership Cost Mix ----
+    chart_left, chart_right = st.columns([2, 1], gap="medium")
+    
+    with chart_left:
+        st.markdown("### Wealth Trajectory (Rent & Invest vs Buy)")
+        wdf = wealth_trajectories(inputs)
+        
+        # Prepare data for stacked bar chart
+        chart_data = pd.DataFrame({
+            'Years': wdf['Years'],
+            'Buy Net Worth': wdf['Buy_NetWorth'],
+            'Rent Investor Wealth FV': wdf['Rent_Investor_Wealth_FV']
+        })
+        
+        # Melt data for stacked bar chart
+        melted_data = pd.melt(chart_data, id_vars=['Years'], 
+                            value_vars=['Buy Net Worth', 'Rent Investor Wealth FV'],
+                            var_name='Scenario', value_name='Wealth')
+        
+        # Create grouped bar chart using Altair
+        bar_chart = alt.Chart(melted_data).mark_bar().encode(
+            x=alt.X('Years:O', title='Years', axis=alt.Axis(labelAngle=0)),
+            y=alt.Y('Wealth:Q', title='Wealth', axis=alt.Axis(format=',.0f')),
+            color=alt.Color('Scenario:N', 
+                          scale=alt.Scale(range=['#FF6B6B', '#4ECDC4']),
+                          legend=alt.Legend(orient='left', titleLimit=0)),
+            xOffset='Scenario:N',
+            tooltip=[alt.Tooltip('Years:O'), 
+                    alt.Tooltip('Scenario:N'), 
+                    alt.Tooltip('Wealth:Q', format=',.0f')]
+        ).properties(
+            height=400
+        )
+        
+        st.altair_chart(bar_chart, use_container_width=True)
+        st.caption("Buy Net Worth = property value − mortgage balance (no sale costs mid-hold).")
+        st.caption("Rent Investor Wealth FV = FV of deposit+fees invested plus invested monthly savings, at the opportunity rate.")
+    
+    with chart_right:
+        st.markdown("### Ownership Cost Mix")
+        odf = ownership_cost_breakdown(inputs, res)
+        
+        # Create pie chart with diverse color palette
+        colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7']
+        
+        pie_chart = alt.Chart(odf).mark_arc(innerRadius=50, outerRadius=120).encode(
+            theta=alt.Theta('Amount:Q'),
+            color=alt.Color('Category:N', 
+                          scale=alt.Scale(range=colors),
+                          legend=alt.Legend(orient='left', titleLimit=0, labelLimit=0)),
+            tooltip=['Category:N', alt.Tooltip('Amount:Q', format=',.0f')]
+        ).resolve_scale(
+            color='independent'
+        )
+        
+        st.altair_chart(pie_chart, use_container_width=False)
+
+    # ---- Sensitivity Analysis ----
+    st.markdown("### Sensitivity — Annual Price Growth")
+    
+    # Slider
+    g_sens = st.slider("Test price growth (%)", -5.0, 8.0, float(inputs.price_growth*100), 0.25) / 100.0
+    
+    # Two-column layout: Chart on left, Metrics on right
+    sens_left, sens_right = st.columns([2, 1], gap="medium")
+    
+    # Calculate sensitivity metrics
+    tmp_inputs = Inputs(**{**inputs.__dict__, "price_growth": g_sens})
+    tmp_res = simulate(tmp_inputs)
+    tmp_cfs = build_owner_cashflows_for_irr(tmp_inputs, tmp_res)
+    tmp_irr = irr_annual_from_monthly_cfs(tmp_cfs)
+    
+    with sens_left:
+        # Chart - Bar chart with whole number years
+        wdf_s = wealth_trajectories(tmp_inputs)
+        # Create bar chart data
+        chart_data = pd.DataFrame({
+            "Year": wdf_s["Years"],
+            "Buy Net Worth": wdf_s["Buy_NetWorth"]
+        })
+        
+        bar_chart = alt.Chart(chart_data).mark_bar(color='#45B7D1').encode(
+            x=alt.X('Year:O', title='Year', axis=alt.Axis(labelAngle=0)),
+            y=alt.Y('Buy Net Worth:Q', title='Buy Net Worth', axis=alt.Axis(format=',.0f')),
+            tooltip=[alt.Tooltip('Year:O'), alt.Tooltip('Buy Net Worth:Q', format=',.0f')]
+        ).properties(
+            height=300
+        )
+        
+        st.altair_chart(bar_chart, use_container_width=True)
+    
+    with sens_right:
+        # Two metrics in separate rows
+        st.metric("Equity IRR (sens)", f"{tmp_irr:.2%}", border=True)
+        st.metric("Net gain after sale (sens)", f"{tmp_res.net_gain_after_sale(tmp_inputs.price, tmp_inputs.ltv)/tmp_inputs.price*100:.2f}%", border=True)
 
 # ---- FAQ Section ----
 st.markdown("---")
