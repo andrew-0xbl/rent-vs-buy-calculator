@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import Optional
 import streamlit as st
+import pandas as pd
 
 st.set_page_config(page_title="Rent vs Buy (UK & Hong Kong)", page_icon="🏠", layout="wide")
 
@@ -32,7 +33,7 @@ DEFAULT_VALUES = {
         "rent_growth": 1.0,  # percentage
         "price_growth": 1.0,  # percentage
         "opportunity_rate": 2.5,  # percentage
-        "maintenance_rate": 1.0,  # percentage
+        "maintenance_rate": 0.30,  # percentage
         "mgmt_fee_psf": 5.5,
         "net_area_sqft": 350.0,
         "buy_legal": 15000.0,
@@ -57,20 +58,6 @@ def remaining_balance(principal: float, annual_rate: float, years: int, months_p
         return principal * (1 - months_paid / n)
     A = monthly_payment(principal, annual_rate, years)
     return principal * (1 + r)**months_paid - A * (((1 + r)**months_paid - 1) / r)
-
-def amortization_interest_paid(principal: float, annual_rate: float, years: int, months: int) -> float:
-    """Calculate total interest paid over specified period using direct formula for efficiency"""
-    r = annual_rate / 12.0
-    if r == 0:
-        return 0.0
-    
-    n = years * 12
-    A = monthly_payment(principal, annual_rate, years)
-    
-    # Direct formula for interest paid in first 'months' payments
-    # Interest = A * months - principal * (1 - (1+r)^(-months)) / r * r
-    # Simplified: Interest = A * months - principal * (1 - (1+r)^(-months))
-    return A * months - principal * (1 - (1 + r) ** (-months))
 
 # ------------------------- Taxes & fees -------------------------
 
@@ -210,9 +197,9 @@ def _compute_core(inputs: Inputs) -> Results:
     buy_one_offs = tax_buy + inputs.buy_legal + agent_buy
 
     A = monthly_payment(loan, inputs.rate, inputs.term_years)
-    total_interest = amortization_interest_paid(loan, inputs.rate, inputs.term_years, months)
     bal_T = remaining_balance(loan, inputs.rate, inputs.term_years, months)
     principal_paid = loan - bal_T
+    total_interest = A * months - principal_paid
 
     maintenance_monthly = (inputs.maintenance_rate * inputs.price) / 12.0
     hk_rates_monthly = rates_like_annual / 12.0
@@ -376,7 +363,7 @@ def simulate(inputs: Inputs) -> Results:
     base = _compute_core(inputs)
 
     # Breakeven search using the core (no recursion)
-    low, high = -0.10, 0.10
+    low, high = -0.20, 0.20
     for _ in range(40):
         mid = (low + high) / 2
         tmp_inputs = Inputs(**{**inputs.__dict__, "price_growth": mid})
@@ -391,6 +378,40 @@ def simulate(inputs: Inputs) -> Results:
     return Results(
         **{**base.__dict__, "breakeven_growth_simple": breakeven}
     )
+
+def horizon_profile_dataframe(inputs: Inputs, max_years: int = 30) -> pd.DataFrame:
+    """
+    Build a DataFrame showing how Equity IRR (annualised) and Net Gain After Sale (% of price)
+    evolve as the holding horizon varies from 1..max_years, using the current inputs for everything else.
+    """
+    horizons = []
+    irr_vals = []
+    gain_vals_pct = []
+
+    for h in range(1, max_years + 1):
+        # Create a shallow copy of inputs with modified hold_years
+        tmp_inputs = Inputs(**{**inputs.__dict__, "hold_years": h})
+
+        # Run the simulation for this horizon
+        res_h = simulate(tmp_inputs)
+
+        # Equity IRR (annualised) for this horizon
+        owner_cfs = build_owner_cashflows_for_irr(tmp_inputs, res_h)
+        irr_annual = irr_annual_from_monthly_cfs(owner_cfs)
+
+        # Economic profit (simple) as % of purchase price
+        gain_simple = res_h.net_gain_after_sale(tmp_inputs.price, tmp_inputs.ltv)
+        gain_pct = (gain_simple / tmp_inputs.price) * 100.0
+
+        horizons.append(h)
+        irr_vals.append(irr_annual * 100.0)  # convert to %
+        gain_vals_pct.append(gain_pct)
+
+    return pd.DataFrame({
+        "Horizon (yrs)": horizons,
+        "Equity IRR (annual %)": irr_vals,
+        "Net Gain After Sale (%)": gain_vals_pct,
+    })
 
 # ------------------------- UI LAYOUT -------------------------
 
@@ -410,7 +431,7 @@ with left:
     ltv = st.slider("Loan-to-value (LTV)", 0.0, 0.95, defaults["ltv"], 0.01, help="Percentage of purchase price financed by mortgage (e.g., 0.80 = 80% mortgage, 20% down payment)")
     rate = st.slider("Mortgage rate (annual %)", 0.0, 10.0, defaults["rate"], 0.05, help="Annual interest rate for your mortgage") / 100.0
     term_years = st.slider("Mortgage term (years)", 5, 40, defaults["term_years"], 1, help="Length of mortgage repayment period")
-    hold_years = st.slider("Holding horizon (years)", 1, 15, defaults["hold_years"], 1, help="How long you plan to own the property before selling")
+    hold_years = st.slider("Holding horizon (years)", 1, 30, defaults["hold_years"], 1, help="How long you plan to own the property before selling")
 
     rent_growth = st.slider("Annual rent growth (%)", 0.0, 10.0, defaults["rent_growth"], 0.25, help="Expected annual increase in rental prices") / 100.0
     price_growth = st.slider("Annual price growth (%)", -10.0, 10.0, defaults["price_growth"], 0.25, help="Expected annual increase in property values") / 100.0
@@ -437,7 +458,7 @@ with left:
         buy_legal = st.number_input("Buyer legal/misc (HKD)", min_value=0.0, value=defaults["buy_legal"], step=500.0, help="Legal fees and miscellaneous costs when buying")
         agent_buy_rate = st.slider("Buyer agent fee (% of price)", 0.0, 2.0, defaults["agent_buy_rate"], 0.1, help="Real estate agent commission when buying (typically 1%)") / 100.0
         sell_fee_rate = st.slider("Selling costs (% of sale price)", 0.0, 3.0, defaults["sell_fee_rate"], 0.1, help="Agent fees and legal costs when selling (typically 2%)") / 100.0
-        sdlt_override = st.number_input("Override AVD (0 = auto)", min_value=0.0, value=0.0, step=1000.0, help="Manual Ad Valorem Duty amount (leave 0 for automatic calculation)")
+        sdlt_override = st.number_input("Override AVD (Simplified) (0 = auto)", min_value=0.0, value=0.0, step=1000.0, help="Manual Ad Valorem Duty amount (leave 0 for automatic calculation)")
         hk_rates_override = st.number_input("Override HK Rates (annual, 0=auto)", min_value=0.0, value=0.0, step=100.0, help="Manual annual rates amount (leave 0 for automatic calculation based on rateable value)")
         hk_govrent_override = st.number_input("Override Gov't Rent (annual, 0=auto)", min_value=0.0, value=0.0, step=100.0, help="Manual annual government rent amount (leave 0 for automatic calculation)")
         sdlt_override_val = None if sdlt_override == 0 else sdlt_override
@@ -466,7 +487,7 @@ with right:
     if basis.startswith("Simple"):
         st.caption("Simple Mode: Economic profit (excludes principal as expense; includes interest, running, buy/sell costs; no discounting; pre-tax).")
     else:
-        st.caption("Opportunity-Adjusted Mode: Economic profit with opportunity costs on tied-up capital and rent payments.")
+        st.caption("Opportunity-Adjusted Mode: Economic profit with opportunity costs on tied-up capital and rent payments. All opportunity adjustments are expressed as end-of-horizon future values (no discounting).")
     
     if basis.startswith("Simple"):
         diff = res.net_cost_owning_simple - res.net_cost_renting_simple
@@ -612,7 +633,7 @@ with right:
     owner_cfs = build_owner_cashflows_for_irr(inputs, res)
     equity_irr_annual = irr_annual_from_monthly_cfs(owner_cfs)
     
-    s1, s2, s3, s4 = st.columns(4)
+    s1, s2, s3 = st.columns(3)
     s1.metric("Sale price (horizon)", f"{cur}{res.final_sale_price:,.0f}", 
               delta=f"{price_change_pct:+.1f}%", border=True, 
               help=f"Expected property value after {inputs.hold_years} years of growth")
@@ -622,14 +643,23 @@ with right:
     s3.metric("Net gain after sale", f"{cur}{net_gain:,.0f}", 
               delta=f"{(net_gain/inputs.price)*100:+.1f}%" if net_gain != 0 else "0.0%", border=True,
               help="Economic profit (excludes principal as expense; includes interest, running, buy/sell costs; no discounting; pre-tax)")
-    s4.metric("Equity Multiple", f"{equity_multiple:,.2f}", border=True,
+
+    t1, t2 = st.columns(2)
+
+    t1.metric("Equity Multiple", f"{equity_multiple:,.2f}", border=True,
               help="(Ending equity) / (Deposit + Principal repaid)")
     
     # Add a new row for IRR
-    st.metric("Equity IRR (annual)", f"{equity_irr_annual:.2%}",
-              help="IRR computed on owner equity cash flows (principal treated as capital, not expense). Equity IRR reflects actual cash flow timing (principal included in cash flows), annualised.")
+    t2.metric("Equity IRR (annual)", f"{equity_irr_annual:.2%}",
+              help="IRR computed on owner equity cash flows (principal treated as capital, not expense). Equity IRR reflects actual cash flow timing (principal included in cash flows), annualised.", border=True)
 
     st.markdown(f"**Breakeven annual price growth (simple, over {inputs.hold_years}y):** {res.breakeven_growth_simple:.2%}")
+
+    # ---- Horizon vs Return Chart ----
+    st.markdown("### Return Profile vs. Holding Horizon")
+    hp_df = horizon_profile_dataframe(inputs, max_years=30)
+    st.line_chart(hp_df.set_index("Horizon (yrs)"), use_container_width=True)
+    st.caption("Equity IRR is annualised and cashflow-based (includes principal timing). Net Gain After Sale is an economic profit (% of purchase price) that excludes principal as an expense but includes interest, running, and transaction costs.")
 
 # ---- FAQ Section ----
 st.markdown("---")
@@ -706,7 +736,7 @@ with st.expander("🏠 What's the difference between UK and Hong Kong modes?"):
     st.markdown("- Legal fees and surveys")
     
     st.markdown("**Hong Kong Mode includes:**")
-    st.markdown("- AVD (Ad Valorem Duty) using Scale 2 rates")
+    st.markdown("- Simplified AVD (Ad Valorem Duty) using Scale 2 rates")
     st.markdown("- Management fees calculated per square foot")
     st.markdown("- Government rent and rates calculations")
     st.markdown("- Buyer agent commissions")
@@ -735,9 +765,4 @@ with st.expander("📊 How should I interpret the results?"):
     in your decision - also consider lifestyle preferences, risk tolerance, and market timing.
     """)
 
-st.download_button(
-    "Download scenario JSON",
-    data=str(inputs.__dict__),
-    file_name="rent_vs_buy_scenario.json",
-)
 st.caption("This tool is a decision aid, not financial advice. Always verify tax/fee rules for your exact case.")
