@@ -604,7 +604,7 @@ with left:
     defaults = DEFAULT_VALUES[jurisdiction]
 
     price = st.number_input("Purchase price", min_value=0.0, value=defaults["price"], step=1000.0, format="%.0f", help="Total price of the property you're considering buying")
-    rent = st.number_input("Current monthly rent", min_value=0.0, value=defaults["rent"], step=50.0, format="%.0f", help="Monthly rent for a comparable property to the one you're buying")
+    rent = st.number_input("Current monthly rent", min_value=1.0, value=defaults["rent"], step=50.0, format="%.0f", help="Monthly rent for a comparable property to the one you're buying")
     ltv = st.slider("Loan-to-value (LTV)", 0.0, 0.95, defaults["ltv"], 0.01, help="Percentage of purchase price financed by mortgage (e.g., 0.80 = 80% mortgage, 20% down payment)")
     rate = st.slider("Mortgage rate (annual %)", 0.0, 10.0, defaults["rate"], 0.05, help="Annual interest rate for your mortgage") / 100.0
     term_years = st.slider("Mortgage term (years)", 5, 40, defaults["term_years"], 1, help="Length of mortgage repayment period")
@@ -939,7 +939,7 @@ with right:
         odf = ownership_cost_breakdown(inputs, res)
         
         # Create pie chart with diverse color palette
-        colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7']
+        colors = ['#ff6e61', '#708dff', '#70ffb0', '#ffd900', '#ff4d4d']
         
         pie_chart = alt.Chart(odf).mark_arc(innerRadius=50, outerRadius=120).encode(
             theta=alt.Theta('Amount:Q'),
